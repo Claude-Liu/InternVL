@@ -18,6 +18,7 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
 
 from .configuration_intern_vit import InternVisionConfig
+import copy
 
 try:
     from .flash_attention import FlashAttention
@@ -73,11 +74,12 @@ class InternVisionEmbeddings(nn.Module):
         self.patch_embedding = nn.Conv2d(
             in_channels=3, out_channels=self.embed_dim, kernel_size=self.patch_size, stride=self.patch_size
         )
-
+        
         self.num_patches = (self.image_size // self.patch_size) ** 2
         self.num_positions = self.num_patches + 1
 
         self.position_embedding = nn.Parameter(torch.randn(1, self.num_positions, self.embed_dim))
+        print("bbbb the size of the image position embedding is {}".format(self.position_embedding.shape))
 
     def forward(self, pixel_values: torch.FloatTensor) -> torch.Tensor:
         batch_size = pixel_values.shape[0]
@@ -283,10 +285,11 @@ class InternVisionModel(PreTrainedModel):
     def __init__(self, config: InternVisionConfig):
         super().__init__(config)
         self.config = config
-
         self.embeddings = InternVisionEmbeddings(config)
         self.encoder = InternVisionEncoder(config)
-
+        #print("aa the size of the image position embedding is {}".format(self.embeddings.position_embedding.shape))
+        #print("aa the size of the mlp in layer 1 is {}".format(self.encoder.layers[0].mlp.fc1.weight.shape))
+    
     def resize_pos_embeddings(self, old_size, new_size, patch_size):
         pos_emb = self.embeddings.position_embedding
         _, num_positions, embed_dim = pos_emb.shape
@@ -296,7 +299,7 @@ class InternVisionModel(PreTrainedModel):
         pos_emb = pos_emb.to(cls_emb.dtype).reshape(1, embed_dim, -1).permute(0, 2, 1)
         pos_emb = torch.cat([cls_emb, pos_emb], dim=1)
         self.embeddings.position_embedding = nn.Parameter(pos_emb)
-        logger.info('Resized position embeddings from {} to {}'.format(old_size, new_size))
+        print('Resized position embeddings from {} to {}'.format(old_size, new_size))
 
     def get_input_embeddings(self):
         return self.embeddings
@@ -321,6 +324,9 @@ class InternVisionModel(PreTrainedModel):
         else:
             if len(pixel_values.shape) == 4:
                 hidden_states = self.embeddings(pixel_values)
+                #print("aa the size of the image position embedding is {}".format(self.embeddings.position_embedding.shape))
+                #print("aa the size of the mlp in layer 1 is {}".format(self.encoder.layers[0].mlp.fc1.weight.shape))
+    
             else:
                 raise ValueError(f'wrong pixel_values size: {pixel_values.shape}')
         encoder_outputs = self.encoder(
@@ -328,6 +334,9 @@ class InternVisionModel(PreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
+        #print("aa the size of the image position embedding is {}".format(self.embeddings.position_embedding.shape))
+        #print("aa the size of the mlp in layer 1 is {}".format(self.encoder.layers[0].mlp.fc1.weight.shape))
+    
         last_hidden_state = encoder_outputs.last_hidden_state
         pooled_output = last_hidden_state[:, 0, :]
 

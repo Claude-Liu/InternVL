@@ -230,7 +230,7 @@ class InternVLModel(InternVLPreTrainedModel):
     config_class = InternVLConfig
     main_input_name = 'pixel_values'
 
-    def __init__(self, config: InternVLConfig, moco=False, queue_size=8192):
+    def __init__(self, config: InternVLConfig, moco=False, queue_size=65536):
         super().__init__(config)
 
         self.moco = moco
@@ -244,7 +244,8 @@ class InternVLModel(InternVLPreTrainedModel):
         self.label_smoothing = config.label_smoothing
 
         self.vision_model = InternVisionModel(config.vision_config)  # frozen
-        #print("the size of the image position embedding is {}".format(self.vision_model.embeddings.position_embedding.shape))
+        print("the size of the image position embedding is {}".format(self.vision_model.embeddings.position_embedding.shape))
+        
         self.qllama = LlamaForCausalLM(config.qllama_config)  # frozen
         self.query_tokens = nn.Parameter(  # trainable
             torch.zeros(1, config.num_query_token, text_hidden_size)
@@ -263,18 +264,18 @@ class InternVLModel(InternVLPreTrainedModel):
 
         # Initialize weights and apply final processing
         # self.post_init()
-        # print(self.moco)
+        for i in range(10):
+            print(self.moco)
         if self.moco:
             self.queue_size = queue_size
             # the momentum constant of the moving average
             self.momentum = 0.995
-            if dist.get_rank() == 0:
-                print(f'Queue size: {self.queue_size}')
+            print(f'Queue size: {self.queue_size}')
+            print(f'Queue size: {self.queue_size}')
 
 
             # create momentum models
-            if dist.get_rank() == 0:
-                print('Creating momentum models...')
+            print('Creating momentum models...')
             self.vision_model_m = InternVisionModel(config.vision_config)
             self.qllama_m = LlamaForCausalLM(config.qllama_config)
             self.query_tokens_m = nn.Parameter(torch.zeros(1, config.num_query_token, text_hidden_size))
@@ -297,15 +298,11 @@ class InternVLModel(InternVLPreTrainedModel):
                 (self.clip_projector2, self.clip_projector2_m),
                 (self.itm_head, self.itm_head_m),
             ]
-            #self.copy_params()
-            print(self.vision_model.encoder.layers[0].mlp.fc1.weight)
-            print(self.vision_model_m.encoder.layers[0].mlp.fc1.weight)
-            if dist.get_rank() == 0:
-                print('Momentum models created.')
+            self.copy_params()
+            print('Momentum models created.')
 
             # create the queue
-            if dist.get_rank() == 0:
-                print('Creating queue...')
+            print('Creating queue...')
             self.register_buffer("image_queue", torch.randn(self.queue_size, clip_embed_dim))
             self.register_buffer("image_backbone_queue", torch.randn(self.queue_size, clip_embed_dim))
             self.register_buffer("text_queue", torch.randn(self.queue_size, clip_embed_dim))
@@ -314,15 +311,16 @@ class InternVLModel(InternVLPreTrainedModel):
             self.image_backbone_queue = nn.functional.normalize(self.image_backbone_queue, dim=1)
             self.image_queue = nn.functional.normalize(self.image_queue, dim=1)
             self.text_queue = nn.functional.normalize(self.text_queue, dim=1)
-            if dist.get_rank() == 0:
-                print('Queue created.')
+            print('Queue created.')
 
         if config.use_backbone_lora:
             self.wrap_backbone_lora(r=config.use_backbone_lora, lora_alpha=config.use_backbone_lora * 2)
         if config.use_qllama_lora:
             self.wrap_qllama_lora(r=config.use_qllama_lora, lora_alpha=config.use_qllama_lora * 2)
-        #print("the value of force_image_size is {}".format(config.force_image_size))
-        #print("the size of the image position embedding is {}".format(self.vision_model.embeddings.position_embedding.shape))
+        print("the value of force_image_size is {}".format(config.force_image_size))
+        print("the size of the image position embedding is {}".format(self.vision_model.embeddings.position_embedding.shape))
+        if self.moco:
+            print("the size of the image position embedding of the vision_model_m is {}".format(self.vision_model_m.embeddings.position_embedding.shape))
         if config.force_image_size:
             self.vision_model.resize_pos_embeddings(
                 old_size=config.vision_config.image_size,
@@ -339,14 +337,8 @@ class InternVLModel(InternVLPreTrainedModel):
             if self.moco:
                 print("the shape of the image position embedding of vision_model_m is {}".format(self.vision_model_m.embeddings.position_embedding.shape))
         # Initialize weights and apply final processing
-        self.post_init()
-        
-    def init_weights(self):
-        super().init_weights()
-        if dist.get_rank() == 0:
-            print("post init")
-          
-            
+        #self.post_init()       
+
     def wrap_backbone_lora(self, r=128, lora_alpha=256, lora_dropout=0.05):
         lora_config = LoraConfig(
             r=r,
@@ -560,14 +552,12 @@ class InternVLModel(InternVLPreTrainedModel):
             image_itc_m = image_itc_m / image_itc_m.norm(dim=1, keepdim=True)
             text_itc_m = text_itc_m / text_itc_m.norm(dim=1, keepdim=True)
         '''
-        # for name, param in self.named_parameters():
-        #     print("------------------------------------")
-        #     # print("the shape of param is {}".format(param.shape))
-        #     # print("the device of param is {}".format(param.device))
-        #     # print("the name of param is {}, param.requires_grad: {}".format(name, param.requires_grad))
-        #     print(f"param name: {name}, shape: {param.shape}, requires_grad: {param.requires_grad}, device: {param.device}/)
-        #     print("------------------------------------")
-        # print()
+        for name, param in self.named_parameters():
+            print("------------------------------------")
+            print("the shape of param is {}".format(param.shape))
+            print("the device of param is {}".format(param.device))
+            print("the name of param is {}".format(name))
+            print("------------------------------------")
 
         if self.moco:
             with torch.no_grad():
@@ -626,10 +616,10 @@ class InternVLModel(InternVLPreTrainedModel):
 
         image_ids = image_ids.view(-1, 1)
         if self.moco:
-            image_ids_all = torch.cat([image_ids.t(), self.idx_queue.clone().detach()], dim=1).t()
+            image_ids_all = torch.cat([image_ids.t(), self.idx_queue.clone().detach()], dim=1)
         else:
             image_ids_all = GatherLayer.apply(image_ids).flatten(0, 1)
-        pos_idx = torch.eq(image_ids, image_ids_all.t()).float()
+        pos_idx = torch.eq(image_ids, image_ids_all).float()
         sim_targets = pos_idx / pos_idx.sum(1, keepdim=True)
 
         loss_t2i = -torch.sum(F.log_softmax(sim_t2i, dim=1) * sim_targets, dim=1).mean()
@@ -662,33 +652,36 @@ class InternVLModel(InternVLPreTrainedModel):
     @torch.no_grad()    
     def copy_params(self):
         if self.moco:
-            if dist.get_rank() == 0:
-                print("copying parameters from base model to momentum model ...")
             for model_pair in self.model_pairs:
+                import pdb;pdb.set_trace()
                 if type(model_pair[0]) == nn.Parameter:
                     model_pair[1].data.copy_(model_pair[0].data)
                     model_pair[1].requires_grad = False
-                elif isinstance(model_pair[0], nn.Module):           
+                elif isinstance(model_pair[0], nn.Module):         
                     for (name, param), (name_m,param_m) in zip(model_pair[0].named_parameters(), model_pair[1].named_parameters()):
                         param_m.data.copy_(param.data)  # initialize
+                        print("------------------------------------")
+                        print("the shape of param is {}".format(param.shape))
+                        print("the device of param is {}".format(param.device))
+                        print("the name of param is {}".format(name))
+                        print("the shape of param_m is {}".format(param_m.shape))
+                        print("the device of param_m is {}".format(param_m.device))
+                        print("the name of param_m is {}".format(name_m))
+                        print("------------------------------------")
                         param_m.requires_grad = False  # not update by gradient
                 else:
                     print("the type of model_pair[0] is {}".format(type(model_pair[0])))
                     print(model_pair[0])
                     raise NotImplementedError
-            if dist.get_rank() == 0:
-                print("finished copying parameters from base model to momentum model ...") 
-                print("mlp weights of vision model{}".format(self.vision_model.encoder.layers[0].mlp.fc1.weight))
-                print("mlp weights of momentum vision model{}".format(self.vision_model_m.encoder.layers[0].mlp.fc1.weight))
+                        
         else:
             pass
 
             
     @torch.no_grad()        
-    def _momentum_update(self, debug=False):
+    def _momentum_update(self):
         if self.moco:
-            if dist.get_rank()==0:
-                print('Updating momentum models...')
+            print('Updating momentum models...')
             for model_pair in self.model_pairs:
                 try:
                     if type(model_pair[0]) == nn.Parameter:
@@ -697,15 +690,14 @@ class InternVLModel(InternVLPreTrainedModel):
                         for (name, param), (name_m,param_m) in zip(model_pair[0].named_parameters(), model_pair[1].named_parameters()):
                             try:
                                 param_m.data = param_m.data * self.momentum + param.data * (1. - self.momentum)
-                                if debug:
-                                    print("------------------------------------")
-                                    print("the shape of param is {}".format(param.shape))
-                                    print("the device of param is {}".format(param.device))
-                                    print("the name of param is {}, param.requires_grad: {}".format(name, param.requires_grad))
-                                    print("the shape of param_m is {}".format(param_m.shape))
-                                    print("the device of param_m is {}".format(param_m.device))
-                                    print("the name of param_m is {}, param_m.requires_grad: {}".format(name_m, param_m.requires_grad))
-                                    print("------------------------------------")
+                                print("------------------------------------")
+                                print("the shape of param is {}".format(param.shape))
+                                print("the device of param is {}".format(param.device))
+                                print("the name of param is {}".format(name))
+                                print("the shape of param_m is {}".format(param_m.shape))
+                                print("the device of param_m is {}".format(param_m.device))
+                                print("the name of param_m is {}".format(name_m))
+                                print("------------------------------------")
                             except:
                                 print("#####################################")
                                 print("the shape of param is {}".format(param.shape))
@@ -716,14 +708,13 @@ class InternVLModel(InternVLPreTrainedModel):
                                 print("the name of param_m is {}".format(name_m))
                                 print("the device of the param_m is {}".format(param_m.device))
                                 print("#####################################")
-                                raise
+                                continue
                     else:
                         raise NotImplementedError
                 except:
                     print("the type of model_pair[0] is {}".format(type(model_pair[0])))
-                    rais
-            if dist.get_rank():
-                print('Momentum models updated.')
+                    raise 
+            print('Momentum models updated.')
         else:
             pass
 

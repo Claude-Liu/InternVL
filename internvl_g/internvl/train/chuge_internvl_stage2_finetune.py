@@ -34,7 +34,7 @@ os.environ['TOKENIZERS_PARALLELISM'] = 'true'
 
 ds_collections = {
     'flickr30k_en_train': {
-        'root': '../clip_benchmark/data/flickr30k/Images/',
+        'root': './data/flickr30k/Images/',
         'annotation': './data/flickr30k/flickr30k_train_karpathy.txt',
     },
     'flickr30k_cn_train': {
@@ -194,28 +194,25 @@ def main():
 
     if 'flickr' in data_args.dataset_name:
         train_dataset = FlickrDataset(metas=ds_collections[data_args.dataset_name],
-                                      tokenizer=tokenizer, data_args=data_args)
+                tokenizer=tokenizer, data_args=data_args)
     elif 'coco' in data_args.dataset_name:
         train_dataset = COCODataset(metas=ds_collections[data_args.dataset_name],
-                                    tokenizer=tokenizer, data_args=data_args)
+                tokenizer=tokenizer, data_args=data_args)
     config = InternVLConfig.from_pretrained(model_args.model_name_or_path)
     config.vision_config.drop_path_rate = model_args.drop_path_rate
 
     # Step 3: Manually load the weights from the .bin files
     # Here you need to specify the path to your weight files
-    print(model_args.apply_moco)
-    model = InternVLModel.from_pretrained(
-        model_args.model_name_or_path,
+    for i in range(100):
+        print(model_args.apply_moco)
+    model = InternVLModel(
+        #model_args.model_name_or_path,
         # ignore_mismatched_sizes=True,
         config=config,
         moco=model_args.apply_moco,
         #low_cpu_mem_usage=False,
     )
-    # copy the parameters from base model to momentum model
-    if model_args.apply_moco:
-        model.copy_params()
     
-    """
     # Step 3: Manually load the weights from the .bin files
     # Here you need to specify the path to your weight files
     weights_files = [
@@ -229,21 +226,29 @@ def main():
     state_dict = {}
     for file in weights_files:
         state_dict.update(torch.load(file, map_location='cpu'))
+    print("number of weights: ", len(state_dict.keys()))
     print("loading the pretrained model ...")
     model.load_state_dict(state_dict, strict=False)
-    print("the pretrained model loaded")
-    """
+    print(">>>> state dict")
+    print("number of model state_dict: ", len(model.state_dict()))
     
-    #model.to(device)
-    """
-    if dist.get_rank() == 0:
-        for name, param in model.named_parameters():
-            print("------------------------------------")
-            print("the shape of param is {}".format(param.shape))
-            print("the device of param is {}".format(param.device))
-            print("the name of param is {}".format(name))
-            print("------------------------------------")
-    """
+    for param, value in model.state_dict().items():
+        print(param, value.shape)
+    extra_params = set(model.state_dict().keys()).difference(set(state_dict.keys()))
+    print("the different of weights and model: ", extra_params)
+    for param in extra_params:
+        print(param, model.state_dict()[param].shape)
+    print("the pretrained model loaded")
+    
+    
+    # model.to(device)
+    # for name, param in model.named_parameters():
+    #     print("------------------------------------")
+    #     print("the shape of param is {}".format(param.shape))
+    #     print("the device of param is {}".format(param.device))
+    #     print("the name of param is {}".format(name))
+    #     print("------------------------------------")
+
     if data_args.force_image_size != 224:
         model.config.force_image_size = data_args.force_image_size
         model.vision_model.resize_pos_embeddings(old_size=224, new_size=data_args.force_image_size, patch_size=14)

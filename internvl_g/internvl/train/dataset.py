@@ -39,6 +39,7 @@ class FlickrDataset(Dataset):
         self.image_ids = []
         self.captions = []
 
+
         for line in lines:
             image, caption = line.strip().split('.jpg,')
             image_id = int(image)
