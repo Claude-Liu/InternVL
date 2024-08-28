@@ -12,6 +12,7 @@ from internvl.dist_utils import init_dist
 from internvl.model.internvl_stage2_retrieval import (InternVLConfig,
                                                       InternVLModel)
 from internvl.train.dataset import COCODataset, FlickrDataset
+from internvl.train.internvl_trainer import InternVLSequentialTrainer
 from internvl.train.trainer_monkey_patch import replace_create_optimizer
 from PIL import Image, ImageFile, PngImagePlugin
 from transformers import (HfArgumentParser, LlamaTokenizer, Trainer,
@@ -19,6 +20,7 @@ from transformers import (HfArgumentParser, LlamaTokenizer, Trainer,
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils.logging import (enable_default_handler,
                                         enable_explicit_format, set_verbosity)
+
 
 IGNORE_INDEX = -100
 Image.MAX_IMAGE_PIXELS = None
@@ -101,6 +103,9 @@ class DataTrainingArguments:
     dataset_name: Optional[str] = field(
         default='flickr30k_en_train',
         metadata={'help': 'Specify the name of dataset to be used.'},
+    )
+    sequential_dataloader: bool = field(
+        default=False, metadata={'help': 'Set to True to enable sequential dataloader.'},
     )
     max_seq_length: Optional[int] = field(
         default=80,
@@ -312,14 +317,24 @@ def main():
     if model_args.use_custom_trainer:
         replace_create_optimizer()
 
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset if training_args.do_train else None,
-        eval_dataset=None,
-        tokenizer=tokenizer,
-        data_collator=default_data_collator,
-    )
+    if data_args.sequential_dataloader:
+        trainer = InternVLSequentialTrainer(
+             model=model,
+            args=training_args,
+            train_dataset=train_dataset if training_args.do_train else None,
+            eval_dataset=None,
+            tokenizer=tokenizer,
+            data_collator=default_data_collator,
+        )
+    else:
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset if training_args.do_train else None,
+            eval_dataset=None,
+            tokenizer=tokenizer,
+            data_collator=default_data_collator,
+        )
 
     # Training
     if training_args.do_train:
