@@ -9,7 +9,7 @@ class InternVLTrainer(Trainer):
         """
         Overriding the evaluate method to include the retrieval metrics
         """
-        raise NotImplementedError("This method is not implemented yet")
+        super().evaluate(eval_dataset=None, ignore_keys=None, metric_key_prefix="eval")
     
 
 def dataloader_with_indices(dataloader):
