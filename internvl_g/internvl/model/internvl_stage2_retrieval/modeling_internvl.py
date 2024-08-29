@@ -721,7 +721,7 @@ class InternVLModel(InternVLPreTrainedModel):
                         raise NotImplementedError
                 except:
                     print("the type of model_pair[0] is {}".format(type(model_pair[0])))
-                    rais
+                    raise
             if dist.get_rank():
                 print('Momentum models updated.')
         else:
