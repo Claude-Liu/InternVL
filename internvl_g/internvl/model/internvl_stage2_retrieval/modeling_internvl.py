@@ -445,17 +445,6 @@ class InternVLModel(InternVLPreTrainedModel):
             return_dict=return_dict)
         image_embeds = vision_outputs[0]
         backbone_embeds = self.clip_projector(image_embeds)
-        # get the image embeddings from the momentum vision encoder
-        '''
-        if self.moco:
-            with torch.no_grad():
-                vision_outputs_m = self.vision_model_m(
-                    pixel_values=pixel_values,
-                    output_hidden_states=output_hidden_states,
-                    return_dict=return_dict)
-                image_embeds_m = vision_outputs_m[0]
-                backbone_embeds_m = self.clip_projector_m(image_embeds_m)
-        '''
 
         # step 2: prepare input_ids and attention_mask for two sub-tasks:
         # 1) image-text matching; 2) image-text contrastive learning.
@@ -502,30 +491,6 @@ class InternVLModel(InternVLPreTrainedModel):
         image_itm_neg, image_itm_pos, image_itc = image_embeds.chunk(repeat_time, dim=0)
         text_itm_neg, text_itm_pos, text_itc = text_embeds.chunk(repeat_time, dim=0)
         image_itm = torch.cat([image_itm_neg, image_itm_pos], dim=0)
-        '''
-        if self.moco:
-            with torch.no_grad():
-                input_embeds_m = self.get_input_embeddings_m()(input_ids)
-                query_tokens_m = self.query_tokens_m.repeat(repeat_time * batch_size, 1, 1)
-                input_embeds_m = torch.cat([query_tokens_m, input_embeds_m], dim=1)
-                if type(self.qllama.model) == LlamaForCausalLM:
-                    outputs_m = self.qllama_m.model.model.forward_train(
-                        inputs_embeds=input_embeds_m,
-                        vision_hidden_states=image_embeds_m,
-                        attention_mask=attention_mask,
-                        output_attentions=output_attentions,
-                        output_hidden_states=output_hidden_states,
-                        return_dict=return_dict,
-                        repeat_time=repeat_time,
-                    ).last_hidden_state
-                else:
-                    raise NotImplementedError
-                image_embeds_m = outputs_m[:, :self.num_query_token]
-                text_embeds_m = outputs_m[:, self.num_query_token:]
-                image_itm_neg_m, image_itm_pos_m, image_itc_m = image_embeds_m.chunk(repeat_time, dim=0)
-                text_itm_neg_m, text_itm_pos_m, text_itc_m = text_embeds_m.chunk(repeat_time, dim=0)
-                #image_itm_m = torch.cat([image_itm_neg_m, image_itm_pos_m], dim=0)
-        '''
         ###============== Image-Text Matching ===================###
         image_itm = self.itm_head(image_itm)
         logits = image_itm.mean(dim=1)
@@ -543,23 +508,11 @@ class InternVLModel(InternVLPreTrainedModel):
         selected = summarize_attention_mask.sum(1) - 1
         text_itc = text_itc[torch.arange(text_itc.shape[0]), selected]
         text_itc = text_itc @ self.text_projection
-        '''
-        if self.moco:
-            image_itc_m = self.clip_projector2_m(image_itc_m)
-            text_itc_m = text_itc_m[torch.arange(text_itc_m.shape[0]), selected]
-            text_itc_m = text_itc_m @ self.text_projection_m
-        '''
         
         # normalized features
         backbone_embeds = backbone_embeds / backbone_embeds.norm(dim=1, keepdim=True)
         image_itc = image_itc / image_itc.norm(dim=1, keepdim=True)
         text_itc = text_itc / text_itc.norm(dim=1, keepdim=True)
-        '''
-        if self.moco:
-            backbone_embeds_m = backbone_embeds_m / backbone_embeds_m.norm(dim=1, keepdim=True)
-            image_itc_m = image_itc_m / image_itc_m.norm(dim=1, keepdim=True)
-            text_itc_m = text_itc_m / text_itc_m.norm(dim=1, keepdim=True)
-        '''
         # for name, param in self.named_parameters():
         #     print("------------------------------------")
         #     # print("the shape of param is {}".format(param.shape))
@@ -835,6 +788,66 @@ class InternVLModel(InternVLPreTrainedModel):
             ).last_hidden_state
         return outputs
 
+    def get_itm_score(
+        self,
+        pixel_values: torch.FloatTensor,
+        input_ids: torch.FloatTensor,
+        attention_mask: torch.LongTensor,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ):
+        # step 1: forward the images through the vision encoder,
+        vision_outputs = self.vision_model(
+            pixel_values=pixel_values,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict
+        )
+        image_embeds = vision_outputs[0]
+        backbone_embeds = self.clip_projector(image_embeds)
+        
+        # step 2: prepare the mask for the image-text matching task
+        batch_size = input_ids.shape[0]
+        query_tokens = self.query_tokens.repeat(batch_size, 1, 1)
+        input_embeds = self.get_input_embeddings()(input_ids)
+        input_embeds = torch.cat([query_tokens, input_embeds], dim=1)
+        image_attention_mask = torch.ones(query_tokens.size()[:-1], dtype=torch.long, device=image_embeds.device)
+        attention_mask = torch.cat([image_attention_mask, attention_mask], dim=1)
+        expand_mask = _expand_mask(attention_mask, input_embeds.dtype).to(
+            input_embeds.device)  # [bsz, 1, tgt_seq_len, src_seq_len]
+
+        # Step 3: Forward the input_ids and attention_mask through the text encoder
+        if type(self.qllama.model) == LlamaForCausalLM:
+            outputs = self.qllama.model.model.forward_train(
+                inputs_embeds=input_embeds,
+                vision_hidden_states=image_embeds,
+                attention_mask=attention_mask,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                repeat_time=1,  # No repetition needed since iamge and text is one-one pair
+            ).last_hidden_state
+        else:
+            outputs = self.qllama.model.forward_train(
+                inputs_embeds=input_embeds,
+                vision_hidden_states=image_embeds,
+                attention_mask=attention_mask,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                repeat_time=1,  # No repetition needed since iamge and text is one-one pair
+            ).last_hidden_state
+            
+        image_embeds = outputs[:, :self.num_query_token]
+        text_embeds = outputs[:, self.num_query_token:]
+        
+        # Step 4: Compute the ITM score
+        image_itm = self.itm_head(image_embeds)
+        itm_scores = image_itm.mean(dim=1)  # Average over the token dimension
+        
+        return itm_scores
+    
+    
     def get_image_features(
             self,
             pixel_values: torch.FloatTensor,

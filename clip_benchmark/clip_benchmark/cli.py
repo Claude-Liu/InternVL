@@ -76,6 +76,7 @@ def get_parser_args():
     parser_eval.add_argument('--model_type', default='open_clip', type=str, choices=MODEL_TYPES, help='clip model type')
     parser_eval.add_argument('--wds_cache_dir', default=None, type=str,
                              help='optional cache directory for webdataset only')
+    parser_eval.add_argument('--use_itm', default=False, action='store_true', help='Use ITM for retrieval')
     parser_eval.set_defaults(which='eval')
 
     parser_build = subparsers.add_parser('build', help='Build CSV from evaluations')
@@ -290,7 +291,8 @@ def run(args):
             tokenizer,
             recall_k_list=args.recall_k,
             device=args.device,
-            amp=args.amp
+            amp=args.amp,
+            use_itm = args.use_itm
         )
     elif task == 'linear_probe':
         # we also need the train split for linear probing.
