@@ -6,11 +6,13 @@ from .internvl import load_internvl
 from .japanese_clip import load_japanese_clip
 from .open_clip import load_open_clip
 
+
 # loading function must return (model, transform, tokenizer)
 TYPE2FUNC = {
     'open_clip': load_open_clip,
     'ja_clip': load_japanese_clip,
     'internvl': load_internvl,
+    'qwen2vl': None,
 }
 MODEL_TYPES = list(TYPE2FUNC.keys())
 

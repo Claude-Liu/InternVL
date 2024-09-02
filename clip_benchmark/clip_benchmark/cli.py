@@ -18,6 +18,7 @@ from clip_benchmark.metrics import (linear_probe, mscoco_generative,
 from clip_benchmark.model_collection import (get_model_collection_from_file,
                                              model_collection)
 from clip_benchmark.models import MODEL_TYPES, load_clip
+from clip_benchmark.models.modeling_qwen2vl_r import Qwen2VLForRetrieval
 
 
 def get_parser_args():
@@ -53,7 +54,7 @@ def get_parser_args():
     parser_eval.add_argument('--skip_load', action='store_true',
                              help='for linear probes, when everything is cached, no need to load model.')
     parser_eval.add_argument('--seed', default=0, type=int, help='random seed.')
-    parser_eval.add_argument('--batch_size', default=64, type=int)
+    parser_eval.add_argument('--batch_size', default=16, type=int)
     parser_eval.add_argument('--model_cache_dir', default=None, type=str,
                              help='directory to where downloaded models are cached')
     parser_eval.add_argument('--feature_root', default='features', type=str,
@@ -77,6 +78,8 @@ def get_parser_args():
     parser_eval.add_argument('--wds_cache_dir', default=None, type=str,
                              help='optional cache directory for webdataset only')
     parser_eval.add_argument('--use_itm', default=False, action='store_true', help='Use ITM for retrieval')
+    parser_eval.add_argument('--use_image_path', default=False, action='store_true',
+                             help="return the image path in the dataset instead of the image itself")
     parser_eval.set_defaults(which='eval')
 
     parser_build = subparsers.add_parser('build', help='Build CSV from evaluations')
@@ -210,15 +213,22 @@ def run(args):
     if args.skip_load:
         model, transform, collate_fn, dataloader = None, None, None, None
     else:
-        model, transform, tokenizer = load_clip(
-            model_type=args.model_type,
-            model_name=args.model,
-            pretrained=args.pretrained,
-            cache_dir=args.model_cache_dir,
-            device=args.device
-        )
+        if args.model_type == "qwen2vl":
+            device = torch.device(args.device)
+            model = Qwen2VLForRetrieval.from_pretrained(args.pretrained,torch_dtype=torch.float16).to(device)
+            transform, tokenizer = None, None
+        else:
+            model, transform, tokenizer = load_clip(
+                model_type=args.model_type,
+                model_name=args.model,
+                pretrained=args.pretrained,
+                cache_dir=args.model_cache_dir,
+                device=args.device
+            )
         print(transform)
         model.eval()
+        if args.model_type == "qwen2vl":
+            args.use_image_path = True 
         dataset = build_dataset(
             dataset_name=args.dataset,
             root=dataset_root,
@@ -230,6 +240,7 @@ def run(args):
             task=task,
             cupl=args.cupl,
             wds_cache_dir=args.wds_cache_dir,
+            use_image_path=args.use_image_path,
         )
         collate_fn = get_dataset_collate_fn(args.dataset)
         if args.verbose:
@@ -276,13 +287,16 @@ def run(args):
             load_clfs=args.load_clfs,
         )
     elif task == 'zeroshot_retrieval':
+        use_qwen2vl = True if args.model_type == "qwen2vl" else False
         metrics = zeroshot_retrieval.evaluate(
             model,
             dataloader,
             tokenizer,
             recall_k_list=args.recall_k,
             device=args.device,
-            amp=args.amp
+            amp=args.amp,
+            use_itm = args.use_itm,
+            use_qwen2vl=use_qwen2vl,
         )
     elif task == 'zeroshot_retrieval_with_itm':
         metrics = zeroshot_retrieval_with_itm.evaluate(
@@ -292,7 +306,6 @@ def run(args):
             recall_k_list=args.recall_k,
             device=args.device,
             amp=args.amp,
-            use_itm = args.use_itm
         )
     elif task == 'linear_probe':
         # we also need the train split for linear probing.

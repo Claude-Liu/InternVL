@@ -334,6 +334,73 @@ class InternVLModel(InternVLPreTrainedModel):
             ).last_hidden_state
         return outputs
 
+    def get_itm_score(
+        self,
+        pixel_values: torch.FloatTensor,
+        input_ids: torch.FloatTensor,
+        attention_mask: torch.LongTensor,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ):
+        # step 1: forward the images through the vision encoder,
+        for name, module in self.vision_model.named_modules():
+            if isinstance(module, torch.nn.Conv2d):
+                print(f"Layer: {name}")
+                print(f"  Weight dtype: {module.weight.dtype}")
+                if module.bias is not None:
+                    print(f"  Bias dtype: {module.bias.dtype}")
+                else:
+                    print("  Bias: None")
+        vision_outputs = self.vision_model(
+            pixel_values=pixel_values,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict
+        )
+        image_embeds = vision_outputs[0]
+        backbone_embeds = self.clip_projector(image_embeds)
+        
+        # step 2: prepare the mask for the image-text matching task
+        batch_size = input_ids.shape[0]
+        query_tokens = self.query_tokens.repeat(batch_size, 1, 1)
+        input_embeds = self.get_input_embeddings()(input_ids)
+        input_embeds = torch.cat([query_tokens, input_embeds], dim=1)
+        image_attention_mask = torch.ones(query_tokens.size()[:-1], dtype=torch.long, device=image_embeds.device)
+        attention_mask = torch.cat([image_attention_mask, attention_mask], dim=1)
+        attention_mask = _expand_mask(attention_mask, input_embeds.dtype).to(
+            input_embeds.device)  # [bsz, 1, tgt_seq_len, src_seq_len]
+
+        # Step 3: Forward the input_ids and attention_mask through the text encoder
+        if type(self.qllama.model) == LlamaForCausalLM:
+            outputs = self.qllama.model.model.forward_train(
+                inputs_embeds=input_embeds,
+                vision_hidden_states=image_embeds,
+                attention_mask=attention_mask,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                repeat_time=1,  # No repetition needed since iamge and text is one-one pair
+            ).last_hidden_state
+        else:
+            outputs = self.qllama.model.forward_train(
+                inputs_embeds=input_embeds,
+                vision_hidden_states=image_embeds,
+                attention_mask=attention_mask,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                repeat_time=1,  # No repetition needed since iamge and text is one-one pair
+            ).last_hidden_state
+            
+        image_embeds = outputs[:, :self.num_query_token]
+        text_embeds = outputs[:, self.num_query_token:]
+        
+        # Step 4: Compute the ITM score
+        image_itm = self.itm_head(image_embeds)
+        itm_scores = image_itm.mean(dim=1)[:,1]  # Average over the token dimension
+        
+        return itm_scores
+
     def get_image_features(
             self,
             pixel_values: torch.FloatTensor,
@@ -346,7 +413,14 @@ class InternVLModel(InternVLPreTrainedModel):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
+        for name, module in self.vision_model.named_modules():
+            if isinstance(module, torch.nn.Conv2d):
+                print(f"Layer: {name}")
+                print(f"  Weight dtype: {module.weight.dtype}")
+                if module.bias is not None:
+                    print(f"  Bias dtype: {module.bias.dtype}")
+                else:
+                    print("  Bias: None")
         vision_outputs = self.vision_model(
             pixel_values=pixel_values,
             output_hidden_states=output_hidden_states,

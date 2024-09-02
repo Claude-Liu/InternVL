@@ -18,6 +18,7 @@ class Flickr(VisionDataset):
             ann_file: str,
             transform: Optional[Callable] = None,
             target_transform: Optional[Callable] = None,
+            use_image_path: bool = False,
     ) -> None:
         super().__init__(root, transform=transform, target_transform=target_transform)
         self.ann_file = os.path.expanduser(ann_file)
@@ -32,6 +33,8 @@ class Flickr(VisionDataset):
                     img = img + '.jpg'
                     data[img].append(caption)
         self.data = list(data.items())
+        self.use_image_path = use_image_path
+        print("---------- pass the path of the image: ", self.use_image_path)
 
     def __getitem__(self, index: int) -> Tuple[Any, Any]:
         """
@@ -44,9 +47,13 @@ class Flickr(VisionDataset):
         img, captions = self.data[index]
 
         # Image
-        img = Image.open(os.path.join(self.root, img)).convert('RGB')
-        if self.transform is not None:
-            img = self.transform(img)
+        if self.use_image_path:
+            # get the image path
+            img = os.path.join(self.root, img)
+        else:
+            img = Image.open(os.path.join(self.root, img)).convert('RGB')
+            if self.transform is not None:
+                img = self.transform(img)
 
         # Captions
         target = captions
