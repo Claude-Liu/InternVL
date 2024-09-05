@@ -9,11 +9,17 @@ from functools import partial
 from typing import Optional
 
 import torch
-from internvl.model import load_model_and_tokenizer
+from internvl.model.internvl_chat import InternVLChatModel
 from internvl.train.dataset import build_transform, dynamic_preprocess
 from PIL import Image
 from textvqa_eval import TextVQAAccuracyEvaluator
 from tqdm import tqdm
+from transformers import AutoTokenizer
+from transformers import Qwen2VLForConditionalGeneration, AutoTokenizer, AutoProcessor
+from qwen_vl_utils import process_vision_info
+
+from transformers import AutoProcessor
+import copy
 
 ds_collections = {
     'vqav2_val': {
@@ -219,6 +225,73 @@ def collate_fn(batches, tokenizer):
     return pixel_values, questions, question_ids, annotations
 
 
+class VQADatasetForQwen2vl(torch.utils.data.Dataset):
+    def __init__(self, train, test, prompt, few_shot,
+                 use_thumbnail=False, max_num=6):
+        """
+        qwen2vl use naive resolution.
+        """
+        self.root = "/mnt/workspace/liulf/data/" # to be changed
+        self.test = open(test).readlines()
+        self.prompt = prompt
+        if few_shot > 0:
+            self.train = open(train).readlines()
+        self.use_thumbnail = use_thumbnail
+        self.max_num = max_num
+        self.processor = AutoProcessor.from_pretrained("/mnt/workspace/liulf/pretrained_models/Qwen2-VL-7B-Instruct")
+        self.message_template =  [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": None},
+                    {"type": "text", "text": Nonw},
+                ],
+            },
+            {
+                "role": "system",
+                "content": None
+            },
+        ]
+
+    def __len__(self):
+        return len(self.test)
+
+    def __getitem__(self, idx):
+        data = json.loads(self.test[idx].strip())
+        image, question, question_id, annotation = data['image'], data[
+            'question'], data['question_id'], data.get('answer', None)
+        image = os.path.join(self.root, image)
+        chat_message = []
+        if self.few_shot > 0:
+            few_shot_samples = random.sample(self.train, self.few_shot)
+            for sample in few_shot_samples:
+                sample = json.loads(sample.strip())
+                image_, question_, question_id_, annotation_ = sample['image'], sample['question'], sample['question_id'], sample.get('answer', None)
+                image_ = os.path.join(self.root, image_)
+                message_user = copy.deepcopy(self.message_template[0])
+                message_user['content'][0]['image'] = image_
+                message_user['content'][1]['text'] = self.prompt + question_
+                message_system = copy.deepcopy(self.message_template[1])
+                message_system['content'] = annotation_
+                chat_message.appned += [message_user, message_system]
+        message_user = copy.deepcopy(self.message_template[0])
+        message_user['content'][0]['image'] = image
+        message_user['content'][1]['text'] = self.prompt + question
+        chat_message.append(message_user)
+
+        text = self.processor.encode_chat_message(chat_message)
+        images_input, video_inputs = process_vision_info([image], self.processor)
+        inputs = self.processor(text=[text], images_input=images_input, video_inputs=video_inputs, 
+                                padding=True, return_tensors="pt")
+        return {
+            input_ids: inputs.input_ids, # torch.Tensor
+            attention_mask: inputs.attention_mask, # torch.Tensor
+            pixel_values: inputs.pixel_values, # torch.Tensor
+            annotation: annotation # str
+        }
+        
+
+
 class VQADataset(torch.utils.data.Dataset):
 
     def __init__(self, train, test, prompt, few_shot, input_size=224, dynamic_image_size=False,
@@ -333,17 +406,27 @@ def evaluate_chat_model():
             input_prompt = infovqa_prompt
         else:
             input_prompt = base_prompt
-
-        dataset = VQADataset(
-            train=ds_collections[ds_name]['train'],
-            test=ds_collections[ds_name]['test'],
-            prompt=input_prompt,
-            few_shot=args.few_shot,
-            input_size=image_size,
-            dynamic_image_size=args.dynamic,
-            use_thumbnail=use_thumbnail,
-            max_num=args.max_num
-        )
+        
+        if args.qwen2vl:
+            dataset = VQADatasetForQwen2vl(
+                train=ds_collections[ds_name]['train'],
+                test=ds_collections[ds_name]['test'],
+                prompt=input_prompt,
+                few_shot=args.few_shot,
+                use_thumbnail=use_thumbnail,
+                max_num=args.max_num
+            )
+        else:
+            dataset = VQADataset(
+                train=ds_collections[ds_name]['train'],
+                test=ds_collections[ds_name]['test'],
+                prompt=input_prompt,
+                few_shot=args.few_shot,
+                input_size=image_size,
+                dynamic_image_size=args.dynamic,
+                use_thumbnail=use_thumbnail,
+                max_num=args.max_num
+            )
         dataloader = torch.utils.data.DataLoader(
             dataset=dataset,
             sampler=InferenceSampler(len(dataset)),
@@ -351,26 +434,45 @@ def evaluate_chat_model():
             num_workers=args.num_workers,
             pin_memory=True,
             drop_last=False,
-            collate_fn=partial(collate_fn, tokenizer=tokenizer),
+            collate_fn=partial(collate_fn, tokenizer=tokenizer) if not args.qwen2vl else None,
         )
 
         outputs = []
-        for _, (pixel_values, questions, question_ids, annotations) in tqdm(enumerate(dataloader)):
-            pixel_values = pixel_values.to(torch.bfloat16).cuda()
+        for _, batch in tqdm(enumerate(dataloader)):
             generation_config = dict(
-                num_beams=args.num_beams,
-                max_new_tokens=ds_collections[ds_name]['max_new_tokens'],
-                min_new_tokens=1,
-                do_sample=True if args.temperature > 0 else False,
-                temperature=args.temperature,
-            )
-            pred = model.chat(
-                tokenizer=tokenizer,
-                pixel_values=pixel_values,
-                question=questions[0],
-                generation_config=generation_config,
-                verbose=True
-            )
+                    num_beams=args.num_beams,
+                    max_new_tokens=ds_collections[ds_name]['max_new_tokens'],
+                    min_new_tokens=1,
+                    do_sample=True if args.temperature > 0 else False,
+                    temperature=args.temperature,
+                )
+            if args.qwen2vl:
+                input_ids, attention_mask, pixel_values, annotations = batch
+                generated_ids = model.generate(input_ids=input_ids, attention_mask=attention_mask,
+                pixel_values=pixel_values, generation_config=generation_config)
+                generated_ids_trimmed = [
+                    out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+                ]
+                pred = processor.batch_decode(
+                    generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+                )
+            else:
+                pixel_values, questions, question_ids, annotations = batch
+                pixel_values = pixel_values.to(torch.bfloat16).cuda()
+                generation_config = dict(
+                    num_beams=args.num_beams,
+                    max_new_tokens=ds_collections[ds_name]['max_new_tokens'],
+                    min_new_tokens=1,
+                    do_sample=True if args.temperature > 0 else False,
+                    temperature=args.temperature,
+                )
+                pred = model.chat(
+                    tokenizer=tokenizer,
+                    pixel_values=pixel_values,
+                    question=questions[0],
+                    generation_config=generation_config,
+                    verbose=True
+                )
             answers = [pred]
 
             for question, question_id, answer, annotation in zip(questions, question_ids, answers, annotations):
@@ -497,7 +599,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch-size', type=int, default=1)
     parser.add_argument('--num-workers', type=int, default=1)
     parser.add_argument('--num-beams', type=int, default=5)
-    parser.add_argument('--temperature', type=float, default=0.0)
+    parser.add_argument('--temperature', type=float, default=0.1)
     parser.add_argument('--out-dir', type=str, default='results')
     parser.add_argument('--few-shot', type=int, default=0)
     parser.add_argument('--seed', type=int, default=0)
@@ -506,6 +608,8 @@ if __name__ == '__main__':
     parser.add_argument('--load-in-8bit', action='store_true')
     parser.add_argument('--load-in-4bit', action='store_true')
     parser.add_argument('--auto', action='store_true')
+
+    parser.add_argument("--qwen2vl", action=store_true, help="Use Qwen2VL model")
     args = parser.parse_args()
 
     if not os.path.exists(args.out_dir):
@@ -523,9 +627,20 @@ if __name__ == '__main__':
 
     torch.cuda.set_device(int(os.getenv('LOCAL_RANK', 0)))
 
-    model, tokenizer = load_model_and_tokenizer(args)
-    image_size = model.config.force_image_size or model.config.vision_config.image_size
-    use_thumbnail = model.config.use_thumbnail
+    if args.auto:
+        os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+    kwargs = {'device_map': 'auto'} if args.auto else {}
+    if args.qwen2vl:
+        model = model = Qwen2VLForRetrieval.from_pretrained(args.pretrained,torch_dtype=torch.float16).eval()
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(args.checkpoint, trust_remote_code=True, use_fast=False)
+        model = InternVLChatModel.from_pretrained(
+            args.checkpoint, low_cpu_mem_usage=True, torch_dtype=torch.bfloat16,
+            load_in_8bit=args.load_in_8bit, load_in_4bit=args.load_in_4bit, **kwargs).eval()
+        image_size = model.config.force_image_size or model.config.vision_config.image_size
+        use_thumbnail = model.config.use_thumbnail
+    if not args.load_in_8bit and not args.load_in_4bit and not args.auto:
+        model = model.cuda()
 
     total_params = sum(p.numel() for p in model.parameters()) / 1e9
     if total_params > 20 or args.dynamic:

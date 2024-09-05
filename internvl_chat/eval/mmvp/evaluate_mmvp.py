@@ -8,11 +8,12 @@ import time
 from functools import partial
 
 import torch
-from internvl.model import load_model_and_tokenizer
+from internvl.model.internvl_chat import InternVLChatModel
 from internvl.train.dataset import build_transform, dynamic_preprocess
 from PIL import Image
 from torch.utils.data import Dataset
 from tqdm import tqdm
+from transformers import AutoTokenizer
 
 ds_collections = {
     'MMVP': {
@@ -267,7 +268,15 @@ if __name__ == '__main__':
 
     torch.cuda.set_device(int(os.getenv('LOCAL_RANK', 0)))
 
-    model, tokenizer = load_model_and_tokenizer(args)
+    if args.auto:
+        os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+    kwargs = {'device_map': 'auto'} if args.auto else {}
+    tokenizer = AutoTokenizer.from_pretrained(args.checkpoint, trust_remote_code=True, use_fast=False)
+    model = InternVLChatModel.from_pretrained(
+        args.checkpoint, low_cpu_mem_usage=True, torch_dtype=torch.bfloat16,
+        load_in_8bit=args.load_in_8bit, load_in_4bit=args.load_in_4bit, **kwargs).eval()
+    if not args.load_in_8bit and not args.load_in_4bit and not args.auto:
+        model = model.cuda()
     image_size = model.config.force_image_size or model.config.vision_config.image_size
     use_thumbnail = model.config.use_thumbnail
 
