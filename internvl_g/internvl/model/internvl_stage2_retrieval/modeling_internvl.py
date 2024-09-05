@@ -843,7 +843,7 @@ class InternVLModel(InternVLPreTrainedModel):
         
         # Step 4: Compute the ITM score
         image_itm = self.itm_head(image_embeds)
-        itm_scores = image_itm.mean(dim=1)  # Average over the token dimension
+        itm_scores = image_itm.mean(dim=1)[:,1]  # Average over the token dimension
         
         return itm_scores
     

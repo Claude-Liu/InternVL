@@ -319,7 +319,7 @@ def main():
 
     if data_args.sequential_dataloader:
         trainer = InternVLSequentialTrainer(
-             model=model,
+            model=model,
             args=training_args,
             train_dataset=train_dataset if training_args.do_train else None,
             eval_dataset=None,
