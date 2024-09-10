@@ -250,6 +250,7 @@ class TextVQAAccuracyEvaluator:
         pred_scores = []
         for entry in tqdm(pred_list):
             pred_answer = self.answer_processor(entry['pred_answer'])
+            #pred_answer = entry['pred_answer']
             unique_answer_scores = self._compute_answer_scores(entry['gt_answers'])
             score = unique_answer_scores.get(pred_answer, 0.0)
             pred_scores.append(score)

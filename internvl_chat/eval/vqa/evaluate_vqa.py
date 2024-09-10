@@ -10,7 +10,7 @@ from typing import Optional
 
 import torch
 from internvl.model.internvl_chat import InternVLChatModel
-from internvl.train.dataset import build_transform, dynamic_preprocess
+#from internvl.train.dataset import build_transform, dynamic_preprocess
 from PIL import Image
 from textvqa_eval import TextVQAAccuracyEvaluator
 from tqdm import tqdm
@@ -21,12 +21,15 @@ from qwen_vl_utils import process_vision_info
 from transformers import AutoProcessor
 import copy
 
+import torchvision.transforms as T
+from torchvision.transforms.functional import InterpolationMode
+
 ds_collections = {
     'vqav2_val': {
-        'train': 'data/vqav2/vqav2_train.jsonl',
-        'test': 'data/vqav2/vqav2_val.jsonl',
-        'question': 'data/vqav2/v2_OpenEnded_mscoco_val2014_questions.json',
-        'annotation': 'data/vqav2/v2_mscoco_val2014_annotations.json',
+        'train': '../../data/vqav2/vqav2_train.jsonl',
+        'test': '../../data/vqav2/vqav2_val.jsonl',
+        'question': '../../data/vqav2/v2_OpenEnded_mscoco_val2014_questions.json',
+        'annotation': '../../data/vqav2/v2_mscoco_val2014_annotations.json',
         'metric': 'vqa_score',
         'max_new_tokens': 10,
     },
@@ -37,18 +40,18 @@ ds_collections = {
         'max_new_tokens': 10,
     },
     'okvqa_val': {
-        'train': 'data/okvqa/okvqa_train.jsonl',
-        'test': 'data/okvqa/okvqa_val.jsonl',
-        'question': 'data/okvqa/OpenEnded_mscoco_val2014_questions.json',
-        'annotation': 'data/okvqa/mscoco_val2014_annotations.json',
+        'train': '../../data/okvqa/okvqa_train.jsonl',
+        'test': '../../data/okvqa/okvqa_val.jsonl',
+        'question': '../../data/okvqa/OpenEnded_mscoco_val2014_questions.json',
+        'annotation': '../../data/okvqa/mscoco_val2014_annotations.json',
         'metric': 'vqa_score',
         'max_new_tokens': 10,
     },
     'textvqa_val': {
-        'train': 'data/textvqa/textvqa_train.jsonl',
-        'test': 'data/textvqa/textvqa_val.jsonl',
-        'question': 'data/textvqa/textvqa_val_questions.json',
-        'annotation': 'data/textvqa/textvqa_val_annotations.json',
+        'train': '../../data/textvqa/textvqa_train.jsonl',
+        'test': '../../data/textvqa/textvqa_val.jsonl',
+        'question': '../../data/textvqa/textvqa_val_questions.json',
+        'annotation': '../../data/textvqa/textvqa_val_annotations.json',
         'metric': 'vqa_score',
         'max_new_tokens': 10,
     },
@@ -61,10 +64,10 @@ ds_collections = {
         'max_new_tokens': 10,
     },
     'vizwiz_val': {
-        'train': 'data/vizwiz/vizwiz_train.jsonl',
-        'test': 'data/vizwiz/vizwiz_val.jsonl',
-        'question': 'data/vizwiz/vizwiz_val_questions.json',
-        'annotation': 'data/vizwiz/vizwiz_val_annotations.json',
+        'train': '../../data/vizwiz/vizwiz_train.jsonl',
+        'test': '../../data/vizwiz/vizwiz_val.jsonl',
+        'question': '../../data/vizwiz/vizwiz_val_questions.json',
+        'annotation': '../../data/vizwiz/vizwiz_val_annotations.json',
         'metric': 'vqa_score',
         'max_new_tokens': 10,
     },
@@ -217,38 +220,201 @@ def evaluate_exact_match_accuracy(entries):
 
 
 def collate_fn(batches, tokenizer):
+    num_patches_list = []
     pixel_values = torch.cat([_['pixel_values'] for _ in batches], dim=0)
     questions = [_['question'] for _ in batches]
     question_ids = [_['question_id'] for _ in batches]
     annotations = [_['annotation'] for _ in batches]
+    if batches[0].get('num_patches_list', None) is not None:
+        for _ in batches:
+            num_patches_list += _['num_patches_list'] 
+    else:
+        num_patches_list = None
 
-    return pixel_values, questions, question_ids, annotations
+    return pixel_values, questions, question_ids, annotations, num_patches_list
 
+from torch.nn.utils.rnn import pad_sequence
+
+def preprocess_image(image, max_size=2048, target_size=1024):
+    """
+    预处理图像：
+    1. 如果图像的任何边长超过 max_size，则将其缩小
+    2. 然后将图像调整为 target_size x target_size
+    3. 最后进行标准化
+    """
+    # 检查图像类型，如果是文件路径，则打开图像
+    if isinstance(image, str):
+        image = Image.open(image).convert('RGB')
+    elif not isinstance(image, Image.Image):
+        raise ValueError("Input must be a PIL Image or a file path")
+
+    # 获取原始图像尺寸
+    original_width, original_height = image.size
+
+    # 定义预处理步骤
+    preprocess_steps = []
+
+    # 如果图像尺寸超过 max_size，先进行缩放
+    if original_width > max_size or original_height > max_size:
+        preprocess_steps.append(T.Resize(max_size))
+
+    # 添加其他预处理步骤
+    preprocess_steps.extend([
+        T.Resize(target_size),
+        T.CenterCrop(target_size),
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    # 组合所有预处理步骤
+    transform = T.Compose(preprocess_steps)
+
+    # 应用预处理
+    return transform(image)
+
+    
+    return image
+
+def collate_fn_qwen2vl(batch, processor, verbose=False):
+    assert len(batch) == 1
+    chat_messages = []
+    images = []
+    annotations = []
+    questions = []
+    question_ids = []
+    
+    for item in batch:
+        chat_messages.append(item['chat_message'])
+        images.append(item['image'])
+        annotations.append(item['annotation'])
+        questions.append(item['question'])
+        question_ids.append(item['question_id'])
+
+    texts = [processor.apply_chat_template(chat, tokenize=False, add_generation_prompt=True) for chat in chat_messages]
+    images_inputs, video_inputs = process_vision_info(chat_messages)
+    #images_inputs = [process_image(image, 2048) for image in images_inputs]
+    inputs = processor(text=texts, images=images_inputs, videos=video_inputs, 
+                       padding=True, return_tensors="pt")
+
+    
+    input_ids = inputs["input_ids"]
+    attention_mask = inputs["attention_mask"]
+    pixel_values = inputs["pixel_values"]
+    image_grid_thw = inputs["image_grid_thw"]
+    if verbose:
+        print("text: {}".format(texts[0]))
+        print("decoded text: {}".format(processor.batch_decode(input_ids)))
+        print(f"input_ids: {input_ids.size()}")
+        print(f"attention_mask: {attention_mask.size()}")
+        print(f"pixel_values: {pixel_values.size()}")
+        print(f"image_grid_thw: {image_grid_thw.size()}")
+        print(f"annotations: {len(annotations)}")
+    assert input_ids.size(0) == attention_mask.size(0) == len(annotations)
+    
+    return input_ids, attention_mask, pixel_values, image_grid_thw, annotations, questions, question_ids
+
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+def build_transform(input_size):
+    MEAN, STD = IMAGENET_MEAN, IMAGENET_STD
+    transform = T.Compose([
+        T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
+        T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
+        T.ToTensor(),
+        T.Normalize(mean=MEAN, std=STD)
+    ])
+    return transform
+
+def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size):
+    best_ratio_diff = float('inf')
+    best_ratio = (1, 1)
+    area = width * height
+    for ratio in target_ratios:
+        target_aspect_ratio = ratio[0] / ratio[1]
+        ratio_diff = abs(aspect_ratio - target_aspect_ratio)
+        if ratio_diff < best_ratio_diff:
+            best_ratio_diff = ratio_diff
+            best_ratio = ratio
+        elif ratio_diff == best_ratio_diff:
+            if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
+                best_ratio = ratio
+    return best_ratio
+
+def dynamic_preprocess(image, min_num=1, max_num=12, image_size=448, use_thumbnail=False):
+    orig_width, orig_height = image.size
+    aspect_ratio = orig_width / orig_height
+
+    # calculate the existing image aspect ratio
+    target_ratios = set(
+        (i, j) for n in range(min_num, max_num + 1) for i in range(1, n + 1) for j in range(1, n + 1) if
+        i * j <= max_num and i * j >= min_num)
+    target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
+
+    # find the closest aspect ratio to the target
+    target_aspect_ratio = find_closest_aspect_ratio(
+        aspect_ratio, target_ratios, orig_width, orig_height, image_size)
+
+    # calculate the target width and height
+    target_width = image_size * target_aspect_ratio[0]
+    target_height = image_size * target_aspect_ratio[1]
+    blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
+
+    # resize the image
+    resized_img = image.resize((target_width, target_height))
+    processed_images = []
+    for i in range(blocks):
+        box = (
+            (i % (target_width // image_size)) * image_size,
+            (i // (target_width // image_size)) * image_size,
+            ((i % (target_width // image_size)) + 1) * image_size,
+            ((i // (target_width // image_size)) + 1) * image_size
+        )
+        # split the image
+        split_img = resized_img.crop(box)
+        processed_images.append(split_img)
+    assert len(processed_images) == blocks
+    if use_thumbnail and len(processed_images) != 1:
+        thumbnail_img = image.resize((image_size, image_size))
+        processed_images.append(thumbnail_img)
+    return processed_images
+
+def load_image(image_file, input_size=448, max_num=12):
+    image = Image.open(image_file).convert('RGB')
+    transform = build_transform(input_size=input_size)
+    images = dynamic_preprocess(image, image_size=input_size, use_thumbnail=True, max_num=max_num)
+    pixel_values = [transform(image) for image in images]
+    pixel_values = torch.stack(pixel_values)
+    return pixel_values
 
 class VQADatasetForQwen2vl(torch.utils.data.Dataset):
     def __init__(self, train, test, prompt, few_shot,
-                 use_thumbnail=False, max_num=6):
+                 use_thumbnail=False, max_num=6, mode="single-round"):
         """
         qwen2vl use naive resolution.
         """
-        self.root = "/mnt/workspace/liulf/data/" # to be changed
+        self.root = "/mnt/workspace/liulf/" # to be changed
         self.test = open(test).readlines()
         self.prompt = prompt
+        self.few_shot = few_shot
         if few_shot > 0:
             self.train = open(train).readlines()
         self.use_thumbnail = use_thumbnail
         self.max_num = max_num
-        self.processor = AutoProcessor.from_pretrained("/mnt/workspace/liulf/pretrained_models/Qwen2-VL-7B-Instruct")
+        self.mode = mode # or "single-round"
+        #self.processor = AutoProcessor.from_pretrained("/mnt/workspace/liulf/pretrained_models/Qwen2-VL-7B-Instruct")
+        self.min_pixels = 1280*28*28
+        self.max_pixels = 5120*28*28
         self.message_template =  [
             {
                 "role": "user",
                 "content": [
-                    {"type": "image", "image": None},
-                    {"type": "text", "text": Nonw},
+                    {"type": "image", "image": None, "min_pixels": self.min_pixels, "max_pixels": self.max_pixels,},
+                    {"type": "text", "text": None},
                 ],
             },
             {
-                "role": "system",
+                "role": "assistant",
                 "content": None
             },
         ]
@@ -260,36 +426,67 @@ class VQADatasetForQwen2vl(torch.utils.data.Dataset):
         data = json.loads(self.test[idx].strip())
         image, question, question_id, annotation = data['image'], data[
             'question'], data['question_id'], data.get('answer', None)
+        #if len(self.prompt) > 0:
+        question = question + ' ' + self.prompt
         image = os.path.join(self.root, image)
         chat_message = []
-        if self.few_shot > 0:
+        if self.few_shot > 0 :
             few_shot_samples = random.sample(self.train, self.few_shot)
-            for sample in few_shot_samples:
-                sample = json.loads(sample.strip())
-                image_, question_, question_id_, annotation_ = sample['image'], sample['question'], sample['question_id'], sample.get('answer', None)
-                image_ = os.path.join(self.root, image_)
-                message_user = copy.deepcopy(self.message_template[0])
-                message_user['content'][0]['image'] = image_
-                message_user['content'][1]['text'] = self.prompt + question_
-                message_system = copy.deepcopy(self.message_template[1])
-                message_system['content'] = annotation_
-                chat_message.appned += [message_user, message_system]
-        message_user = copy.deepcopy(self.message_template[0])
-        message_user['content'][0]['image'] = image
-        message_user['content'][1]['text'] = self.prompt + question
-        chat_message.append(message_user)
+            if self.mode == "multi-round":
+                for sample in few_shot_samples:
+                    sample = json.loads(sample.strip())
+                    image_, question_, question_id_, annotation_ = sample['image'], sample['question'], sample['question_id'], sample.get('answer', None)
+                    image_ = os.path.join(self.root, image_)
+                    question_ = question_ + ' ' + self.prompt
+                    message_user = copy.deepcopy(self.message_template[0])
+                    message_user['content'][0]['image'] = image_
+                    message_user['content'][1]['text'] = question_
+                    message_system = copy.deepcopy(self.message_template[1])
+                    message_system['content'] = annotation_
+                    chat_message += [message_user, message_system]
+            else:
+                assert self.mode == "single-round"
+                message = {"role": "user",  "content": [],}
+                chat_message.append(message) # single round
+                for sample in few_shot_samples:
+                    sample = json.loads(sample.strip())
+                    image_, question_, question_id_, annotation_ = sample['image'], sample['question'], sample['question_id'], sample.get('answer', None)
+                    question_ = question_ + ' ' + self.prompt
+                    image_ = os.path.join(self.root, image_)
+                    chat_message[0]['content'].append({
+                        "type": "image",
+                        "image": image_,
+                        "min_pixels": self.min_pixels, "max_pixels": self.max_pixels,
+                    })
+                    chat_message[0]['content'].append({
+                        "type": "text",
+                        "text": question_ + " The answer is \n" + annotation_,
+                    })
 
-        text = self.processor.encode_chat_message(chat_message)
-        images_input, video_inputs = process_vision_info([image], self.processor)
-        inputs = self.processor(text=[text], images_input=images_input, video_inputs=video_inputs, 
-                                padding=True, return_tensors="pt")
+        if self.mode == "multi-round" or self.few_shot == 0:
+            message_user = copy.deepcopy(self.message_template[0])
+            message_user['content'][0]['image'] = image
+            message_user['content'][1]['text'] = question
+            chat_message.append(message_user)
+        else:
+            assert self.mode == "single-round"
+            chat_message[0]['content'].append({
+                "type": "image",
+                "image": image,
+                "min_pixels": self.min_pixels, "max_pixels": self.max_pixels,
+            })
+            chat_message[0]['content'].append({
+                "type": "text",
+                "text": question,
+            })
+
         return {
-            input_ids: inputs.input_ids, # torch.Tensor
-            attention_mask: inputs.attention_mask, # torch.Tensor
-            pixel_values: inputs.pixel_values, # torch.Tensor
-            annotation: annotation # str
-        }
-        
+        'chat_message': chat_message,
+        'image': image,
+        'annotation': annotation,
+        'question_id': question_id,
+        'question': question,
+    }
 
 
 class VQADataset(torch.utils.data.Dataset):
@@ -303,9 +500,10 @@ class VQADataset(torch.utils.data.Dataset):
         self.use_thumbnail = use_thumbnail
         self.few_shot = few_shot
         self.max_num = max_num
+        self.image_pad = "<image>"
         if few_shot > 0:
             self.train = open(train).readlines()
-        self.transform = build_transform(is_train=False, input_size=input_size)
+        #self.transform = build_transform(is_train=False, input_size=input_size)
 
     def __len__(self):
         return len(self.test)
@@ -314,32 +512,37 @@ class VQADataset(torch.utils.data.Dataset):
         data = json.loads(self.test[idx].strip())
         image, question, question_id, annotation = data['image'], data[
             'question'], data['question_id'], data.get('answer', None)
+        image = os.path.join('/mnt/workspace/liulf/', image)
 
-        few_shot_prompt = ''
+        few_shot_prompt = ""
         if self.few_shot > 0:
+            pixel_values_list = []
+            num_patches_list = []
             few_shot_samples = random.sample(self.train, self.few_shot)
             for sample in few_shot_samples:
                 sample = json.loads(sample.strip())
-                few_shot_prompt += self.prompt.format(
-                    sample['image'],
-                    sample['question']) + f" {sample['answer']}"
+                few_shot_prompt += self.image_pad + "\n" + sample["question"] + ' ' + self.prompt +"\n"+ sample['answer'] + "\n"
+                pixel_values_ = load_image(os.path.join('/mnt/workspace/liulf/', sample['image']), input_size=self.input_size, max_num=self.max_num)
+                pixel_values_list.append(pixel_values_)
+                num_patches_list.append(pixel_values_.size(0))
 
-        image = Image.open(image).convert('RGB')
-        if self.dynamic_image_size:
-            images = dynamic_preprocess(image, image_size=self.input_size,
-                                        use_thumbnail=self.use_thumbnail,
-                                        max_num=self.max_num)
+        if self.few_shot == 0:
+            pixel_values = load_image(image, input_size=self.input_size, max_num=self.max_num)
         else:
-            images = [image]
-        pixel_values = [self.transform(image) for image in images]
-        pixel_values = torch.stack(pixel_values)
+            pixel_values_ = load_image(image, input_size=self.input_size, max_num=self.max_num)
+            pixel_values_list.append(pixel_values_)
+            num_patches_list.append(pixel_values_.size(0))
+            pixel_values = torch.cat(pixel_values_list, dim=0)
         if len(self.prompt) != 0:
-            question = question + ' ' + self.prompt
+            question = self.image_pad + "\n" + question + ' ' + self.prompt
+        if len(few_shot_prompt) != 0:
+            question = few_shot_prompt + ' ' + question
         return {
             'question_id': question_id,
             'question': question,
             'pixel_values': pixel_values,
-            'annotation': annotation
+            'annotation': annotation,
+            "num_patches_list": num_patches_list if self.few_shot > 0 else None
         }
 
 
@@ -387,6 +590,12 @@ def post_process(response):
     response = response.strip()
     return response
 
+def get_gpu_info():
+    try:
+        output = subprocess.check_output(['nvidia-smi'], universal_newlines=True)
+        return output
+    except subprocess.CalledProcessError:
+        return "nvidia-smi command failed"
 
 def evaluate_chat_model():
     base_prompt = 'Answer the question using a single word or phrase.'
@@ -396,6 +605,8 @@ def evaluate_chat_model():
     ai2d_prompt = ''
     random.seed(args.seed)
     summaries = []
+
+    print(args.few_shot)
 
     for ds_name in args.datasets:
         if 'vizwiz' in ds_name:
@@ -413,8 +624,8 @@ def evaluate_chat_model():
                 test=ds_collections[ds_name]['test'],
                 prompt=input_prompt,
                 few_shot=args.few_shot,
-                use_thumbnail=use_thumbnail,
-                max_num=args.max_num
+                max_num=args.max_num,
+                mode=args.mode
             )
         else:
             dataset = VQADataset(
@@ -434,11 +645,11 @@ def evaluate_chat_model():
             num_workers=args.num_workers,
             pin_memory=True,
             drop_last=False,
-            collate_fn=partial(collate_fn, tokenizer=tokenizer) if not args.qwen2vl else None,
+            collate_fn=partial(collate_fn, tokenizer=tokenizer) if not args.qwen2vl else partial(collate_fn_qwen2vl, processor=processor),
         )
 
         outputs = []
-        for _, batch in tqdm(enumerate(dataloader)):
+        for i, batch in tqdm(enumerate(dataloader)):
             generation_config = dict(
                     num_beams=args.num_beams,
                     max_new_tokens=ds_collections[ds_name]['max_new_tokens'],
@@ -447,17 +658,38 @@ def evaluate_chat_model():
                     temperature=args.temperature,
                 )
             if args.qwen2vl:
-                input_ids, attention_mask, pixel_values, annotations = batch
-                generated_ids = model.generate(input_ids=input_ids, attention_mask=attention_mask,
-                pixel_values=pixel_values, generation_config=generation_config)
-                generated_ids_trimmed = [
-                    out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-                ]
-                pred = processor.batch_decode(
-                    generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-                )
+                with torch.no_grad():
+                    try:
+                        input_ids, attention_mask, pixel_values, image_grid_thw, annotations, questions, question_ids = batch
+                        input_ids = input_ids.cuda()
+                        attention_mask = attention_mask.cuda()
+                        pixel_values = pixel_values.cuda()
+                        image_grid_thw = image_grid_thw.cuda()
+                        generated_ids = model.generate(input_ids=input_ids, attention_mask=attention_mask,
+                                                        pixel_values=pixel_values, image_grid_thw=image_grid_thw, max_new_tokens=2048,
+                                                        do_sample=True,
+                                                        top_p=0.001,
+                                                        top_k=1,
+                                                        temperature=0.01,
+                                                        repetition_penalty=1.0,)
+                        generated_ids_trimmed = [
+                            out_ids[len(in_ids) :] for in_ids, out_ids in zip(input_ids, generated_ids)
+                        ]
+                        pred = processor.batch_decode(
+                            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+                        )
+                    except:
+                        #print(get_gpu_info())
+                        print(question_ids)
+                        raise
+                if i<5:
+                    print("pred: {}".format(pred))
+                answers = pred
             else:
-                pixel_values, questions, question_ids, annotations = batch
+                pixel_values, questions, question_ids, annotations, num_patches_list = batch
+                print(f"pixel_values: {pixel_values.size()}")
+                print(f"questions: {len(questions)}")
+                print(questions[0])
                 pixel_values = pixel_values.to(torch.bfloat16).cuda()
                 generation_config = dict(
                     num_beams=args.num_beams,
@@ -471,9 +703,15 @@ def evaluate_chat_model():
                     pixel_values=pixel_values,
                     question=questions[0],
                     generation_config=generation_config,
-                    verbose=True
+                    num_patches_list = num_patches_list,
+                    verbose=False,
                 )
-            answers = [pred]
+                if i<5:
+                    print("question: {}".format(questions[0]))
+                    print("pred: {}".format(pred))
+                answers = [pred]
+            if i>=20 and args.debug:
+                break
 
             for question, question_id, answer, annotation in zip(questions, question_ids, answers, annotations):
                 if ds_name in ['vqav2_val', 'vqav2_testdev', 'okvqa_val', 'textvqa_val',
@@ -528,6 +766,9 @@ def evaluate_chat_model():
 
         if torch.distributed.get_rank() == 0:
             print(f'Evaluating {ds_name} ...')
+            if args.debug:
+                for item in merged_outputs:
+                    print(item)
             time_prefix = time.strftime('%y%m%d%H%M%S', time.localtime())
             results_file = f'{ds_name}_{time_prefix}.json'
             results_file = os.path.join(args.out_dir, results_file)
@@ -596,7 +837,7 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint', type=str, default='')
     parser.add_argument('--datasets', type=str,
                         default='okvqa_val,textvqa_val,vizwiz_val,ai2diagram_test,gqa_testdev_llava')
-    parser.add_argument('--batch-size', type=int, default=1)
+    parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--num-workers', type=int, default=1)
     parser.add_argument('--num-beams', type=int, default=5)
     parser.add_argument('--temperature', type=float, default=0.1)
@@ -609,15 +850,16 @@ if __name__ == '__main__':
     parser.add_argument('--load-in-4bit', action='store_true')
     parser.add_argument('--auto', action='store_true')
 
-    parser.add_argument("--qwen2vl", action=store_true, help="Use Qwen2VL model")
+    parser.add_argument("--qwen2vl", action='store_true', help="Use Qwen2VL model")
+    parser.add_argument("--few_shot", type=int, default=0, help="Few shot samples")
+    parser.add_argument("--debug", action='store_true', help="Debug mode")
+    parser.add_argument("--mode", type=str, default="single-round", help="multi-round or single-round")
     args = parser.parse_args()
-
-    if not os.path.exists(args.out_dir):
-        os.makedirs(args.out_dir)
 
     args.datasets = args.datasets.split(',')
     print('datasets:', args.datasets)
-    assert args.batch_size == 1, 'Only batch size 1 is supported'
+    if not args.qwen2vl:
+        assert args.batch_size == 1, 'Only batch size 1 is supported'
 
     torch.distributed.init_process_group(
         backend='nccl',
@@ -627,18 +869,26 @@ if __name__ == '__main__':
 
     torch.cuda.set_device(int(os.getenv('LOCAL_RANK', 0)))
 
+    if torch.distributed.get_rank() == 0 and not os.path.exists(args.out_dir):
+        os.makedirs(args.out_dir)
+
     if args.auto:
         os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
     kwargs = {'device_map': 'auto'} if args.auto else {}
     if args.qwen2vl:
-        model = model = Qwen2VLForRetrieval.from_pretrained(args.pretrained,torch_dtype=torch.float16).eval()
+        model = Qwen2VLForConditionalGeneration.from_pretrained(
+        args.checkpoint, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2",).eval()
+        min_pixels = 1280 * 28 * 28
+        max_pixels = 5120 * 28 * 28
+        processor = AutoProcessor.from_pretrained("/mnt/workspace/liulf/pretrained_models/Qwen2-VL-7B-Instruct", )
+        torch.cuda.empty_cache() # release the cached memory
     else:
         tokenizer = AutoTokenizer.from_pretrained(args.checkpoint, trust_remote_code=True, use_fast=False)
         model = InternVLChatModel.from_pretrained(
             args.checkpoint, low_cpu_mem_usage=True, torch_dtype=torch.bfloat16,
             load_in_8bit=args.load_in_8bit, load_in_4bit=args.load_in_4bit, **kwargs).eval()
-        image_size = model.config.force_image_size or model.config.vision_config.image_size
         use_thumbnail = model.config.use_thumbnail
+        image_size = model.config.force_image_size or model.config.vision_config.image_size
     if not args.load_in_8bit and not args.load_in_4bit and not args.auto:
         model = model.cuda()
 
@@ -648,9 +898,10 @@ if __name__ == '__main__':
         print(f'[test] total_params: {total_params}B, use num_beams: {args.num_beams}')
     else:
         print(f'[test] total_params: {total_params}B')
-    print(f'[test] image_size: {image_size}')
-    print(f'[test] template: {model.config.template}')
-    print(f'[test] dynamic_image_size: {args.dynamic}')
-    print(f'[test] use_thumbnail: {use_thumbnail}')
+    if not args.qwen2vl:
+        print(f'[test] image_size: {image_size}')
+        print(f'[test] template: {model.config.template}')
+        print(f'[test] dynamic_image_size: {args.dynamic}')
+        print(f'[test] use_thumbnail: {use_thumbnail}')
 
     evaluate_chat_model()
